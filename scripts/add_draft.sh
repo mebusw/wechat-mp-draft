@@ -33,15 +33,11 @@ if ! command -v jq &> /dev/null; then
     exit 1
 fi
 
-# 处理 HTML 内容：
-# 1. 将换行符替换为空格（JSON 不支持原始换行）
-# 2. 压缩多余空格
-CLEAN_CONTENT=$(echo "$CONTENT" | tr '\n' ' ' | sed 's/  */ /g' | sed 's/^ *//;s/ *$//')
 
 # 构造 JSON 请求体
 JSON=$(jq -n \
     --arg title "$TITLE" \
-    --arg content "$CLEAN_CONTENT" \
+    --arg content "$CONTENT" \
     --arg author "$AUTHOR" \
     --arg digest "$DIGEST" \
     --arg thumb "$THUMB_MEDIA_ID" \
@@ -57,6 +53,7 @@ JSON=$(jq -n \
             only_fans_can_comment: 0
         }]
     }')
+
 
 # 调用 API
 RESPONSE=$(curl -s -X POST "https://api.weixin.qq.com/cgi-bin/draft/add?access_token=${ACCESS_TOKEN}" \
