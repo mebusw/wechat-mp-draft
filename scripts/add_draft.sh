@@ -54,6 +54,10 @@ JSON=$(jq -n \
         }]
     }')
 
+# Debug
+echo "----"
+echo "$JSON"
+echo "----"
 
 # 调用 API
 RESPONSE=$(curl -s -X POST "https://api.weixin.qq.com/cgi-bin/draft/add?access_token=${ACCESS_TOKEN}" \
