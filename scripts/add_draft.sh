@@ -33,6 +33,71 @@ if ! command -v jq &> /dev/null; then
     exit 1
 fi
 
+# 检查 python3 是否可用（用于 HTML normalization + 自检）
+if ! command -v python3 &> /dev/null; then
+    echo "错误：需要 python3（用于 WeChat HTML normalization）"
+    exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# WeChat MP editor list normalization — defensive sanitizer.
+#
+# Mirrors the post-processing built into wechat-markdown-html-render. Re-applied
+# here as defense-in-depth because content may be hand-written, copy-pasted, or
+# routed through a pretty-printer that re-introduces inter-<li> whitespace
+# between rendering and publishing — both symptoms produce silently broken
+# ordered lists in the published article. See SKILL.md "Troubleshooting" for
+# the underlying MP editor quirks.
+# ---------------------------------------------------------------------------
+SANITIZED=$(printf '%s' "$CONTENT" | python3 -c '
+import re, sys
+html = sys.stdin.read()
+
+# 1. Strip whitespace between <ol>/<ul> and <li>, between sibling <li>s, and
+#    before the closing </ol>/</ul>. The MP editor treats those whitespace
+#    text nodes as additional empty list items.
+html = re.sub(r"(<(?:ol|ul)\b[^>]*>)\s+(<li\b)", r"\1\2", html, flags=re.I)
+html = re.sub(r"(</li>)\s+(<li\b)", r"\1\2", html, flags=re.I)
+html = re.sub(r"(</li>)\s+(</(?:ol|ul)>)", r"\1\2", html, flags=re.I)
+
+sys.stdout.write(html)
+')
+
+# Pre-send self-check — abort if the payload still has the known anti-patterns,
+# so the user gets a clear error instead of a silently-broken article.
+CHECK=$(printf '%s' "$SANITIZED" | python3 -c '
+import re, sys, json
+h = sys.stdin.read()
+li_count    = len(re.findall(r"<li\b[^>]*>", h, re.I))
+ol_count    = len(re.findall(r"<ol\b[^>]*>", h, re.I))
+ul_count    = len(re.findall(r"<ul\b[^>]*>", h, re.I))
+sec_in_li   = len(re.findall(r"<li\b[^>]*>\s*<section\b", h, re.I))
+gap_li_li   = len(re.findall(r"</li>\s+<li\b", h, re.I))
+gap_ol_li   = len(re.findall(r"<(?:ol|ul)\b[^>]*>\s+<li\b", h, re.I))
+gap_li_ol   = len(re.findall(r"</li>\s+</(?:ol|ul)>", h, re.I))
+print(json.dumps({
+    "li": li_count, "ol": ol_count, "ul": ul_count,
+    "section_in_li": sec_in_li,
+    "whitespace_between_li": gap_li_li,
+    "whitespace_ol_to_li":   gap_ol_li,
+    "whitespace_li_to_ol":   gap_li_ol,
+}))
+')
+echo "==> WeChat HTML self-check: $CHECK"
+SEC_IN_LI=$(echo "$CHECK" | jq -r '.section_in_li')
+WS_LI_LI=$(echo "$CHECK"  | jq -r '.whitespace_between_li')
+WS_OL_LI=$(echo "$CHECK"  | jq -r '.whitespace_ol_to_li')
+WS_LI_OL=$(echo "$CHECK"  | jq -r '.whitespace_li_to_ol')
+if [ "$SEC_IN_LI" != "0" ]; then
+    echo "⚠️  Warning: $SEC_IN_LI <li> still contain <section> wrappers — MP editor will drop the list markers and add blank rows."
+    echo "   Fix: re-render with wechat-markdown-html-render (the renderer flattens these automatically)."
+fi
+if [ "$WS_LI_LI" != "0" ] || [ "$WS_OL_LI" != "0" ] || [ "$WS_LI_OL" != "0" ]; then
+    echo "❌ Internal error: whitespace between list elements was not stripped (li↔li=$WS_LI_LI, ol→li=$WS_OL_LI, li→ol=$WS_LI_OL)."
+    exit 1
+fi
+
+CONTENT="$SANITIZED"
 
 # 构造 JSON 请求体
 JSON=$(jq -n \
