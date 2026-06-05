@@ -50,8 +50,31 @@ fi
 # the underlying MP editor quirks.
 # ---------------------------------------------------------------------------
 SANITIZED=$(printf '%s' "$CONTENT" | python3 -c '
-import re, sys
+import re, sys, json
 html = sys.stdin.read()
+title = sys.argv[1] if len(sys.argv) > 1 else ""
+
+# 0. Strip a leading <h1>...</h1> from the body. The article title is already
+#    passed as the `title` field, and the WeChat MP editor renders that title
+#    at the top of the article. If the body still contains the same H1
+#    (because the source markdown started with `# Title`), the title appears
+#    twice — once as the article header, once inside the body. We strip
+#    unconditionally; section headings inside the body should be H2+.
+#
+#    The markdown renderer wraps everything in <section id="nice" ...> for
+#    styling, so the H1 may be the FIRST CHILD of that wrapper rather than
+#    the literal first token. Allow an optional leading <section|div> opener
+#    before the H1 (the matching </section> stays intact and remains a valid
+#    empty container).
+stripped_h1_text = None
+m = re.match(
+    r"\s*(?:<(?:section|div)\b[^>]*>\s*)?<h1\b[^>]*>(.*?)</h1>\s*",
+    html, flags=re.I | re.S,
+)
+if m:
+    inner = m.group(1)
+    stripped_h1_text = re.sub(r"<[^>]+>", "", inner).strip()
+    html = html[m.end():]
 
 # 1. Strip whitespace between <ol>/<ul> and <li>, between sibling <li>s, and
 #    before the closing </ol>/</ul>. The MP editor treats those whitespace
@@ -60,12 +83,26 @@ html = re.sub(r"(<(?:ol|ul)\b[^>]*>)\s+(<li\b)", r"\1\2", html, flags=re.I)
 html = re.sub(r"(</li>)\s+(<li\b)", r"\1\2", html, flags=re.I)
 html = re.sub(r"(</li>)\s+(</(?:ol|ul)>)", r"\1\2", html, flags=re.I)
 
+# Emit stripped-h1 info on a sentinel line so the shell side can pick it up.
+print("__H1_STRIPPED__" + json.dumps(stripped_h1_text, ensure_ascii=False))
 sys.stdout.write(html)
-')
+' "$TITLE")
+
+CONTENT="$SANITIZED"
+
+# Parse the H1-stripped sentinel from the python sanitizer output and keep
+# only the actual HTML body for downstream use.
+H1_STRIPPED_LINE=$(printf '%s\n' "$CONTENT" | grep -m1 '^__H1_STRIPPED__' || true)
+if [ -n "$H1_STRIPPED_LINE" ]; then
+    H1_STRIPPED=$(printf '%s' "$H1_STRIPPED_LINE" | sed 's/^__H1_STRIPPED__//')
+    CONTENT=$(printf '%s\n' "$CONTENT" | grep -v '^__H1_STRIPPED__' || true)
+else
+    H1_STRIPPED="null"
+fi
 
 # Pre-send self-check — abort if the payload still has the known anti-patterns,
 # so the user gets a clear error instead of a silently-broken article.
-CHECK=$(printf '%s' "$SANITIZED" | python3 -c '
+CHECK=$(printf '%s' "$CONTENT" | python3 -c '
 import re, sys, json
 h = sys.stdin.read()
 li_count    = len(re.findall(r"<li\b[^>]*>", h, re.I))
@@ -84,6 +121,37 @@ print(json.dumps({
 }))
 ')
 echo "==> WeChat HTML self-check: $CHECK"
+
+# Report the H1 that was (or wasn't) stripped from the body. This is the
+# critical signal that prevents the "title appears twice" bug — the article
+# title is rendered by the WeChat editor from the `title` field, so a leading
+# H1 left in the body would duplicate it.
+H1_JSON=$(H1_STRIPPED="$H1_STRIPPED" TITLE="$TITLE" python3 -c '
+import json, os
+stripped = os.environ.get("H1_STRIPPED") or "null"
+if stripped and stripped != "null":
+    try:
+        stripped = json.loads(stripped)
+    except Exception:
+        pass
+title = os.environ.get("TITLE") or ""
+print(json.dumps({
+    "h1_stripped_from_body": stripped,
+    "matches_title_param": bool(stripped) and stripped == title,
+}, ensure_ascii=False))
+')
+echo "==> Title-h1 self-check: $H1_JSON"
+H1_STRIPPED_TEXT=$(echo "$H1_JSON" | jq -r '.h1_stripped_from_body')
+H1_MATCHES=$(echo "$H1_JSON" | jq -r '.matches_title_param')
+if [ "$H1_STRIPPED_TEXT" = "null" ] || [ -z "$H1_STRIPPED_TEXT" ]; then
+    # No leading <h1> in the body — nothing to do, no message needed.
+    :
+elif [ "$H1_MATCHES" = "true" ]; then
+    echo "✅ 标题去重: body 顶部的 <h1> 已自动剥离（与 title 参数一致），避免重复显示"
+else
+    echo "⚠️  body 顶部的 <h1>「$H1_STRIPPED_TEXT」与 title 参数「$TITLE」不一致 —— 已剥离 body 的 H1，但请检查是否本意如此"
+fi
+
 SEC_IN_LI=$(echo "$CHECK" | jq -r '.section_in_li')
 WS_LI_LI=$(echo "$CHECK"  | jq -r '.whitespace_between_li')
 WS_OL_LI=$(echo "$CHECK"  | jq -r '.whitespace_ol_to_li')
@@ -96,8 +164,6 @@ if [ "$WS_LI_LI" != "0" ] || [ "$WS_OL_LI" != "0" ] || [ "$WS_LI_OL" != "0" ]; t
     echo "❌ Internal error: whitespace between list elements was not stripped (li↔li=$WS_LI_LI, ol→li=$WS_OL_LI, li→ol=$WS_LI_OL)."
     exit 1
 fi
-
-CONTENT="$SANITIZED"
 
 # 构造 JSON 请求体
 JSON=$(jq -n \
