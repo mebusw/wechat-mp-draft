@@ -1,11 +1,14 @@
 # 微信公众号草稿 API 参考
 
+> 官网文档：https://developers.weixin.qq.com/doc/subscription/api/
+
 ## 接口列表
 
 | 接口 | 路径 | 说明 |
 |------|------|------|
 | 获取 Access Token | `/cgi-bin/token` | 获取接口调用凭证 |
 | 上传永久素材 | `/cgi-bin/material/add_material` | 上传封面图片等素材 |
+| 上传图文消息内的图片获取URL | `/cgi-bin/media/uploadimg` | 上传正文内嵌图片，返回可直接用于 `<img>` 的 URL |
 | 新增草稿 | `/cgi-bin/draft/add` | 保存文章到草稿箱 |
 | 获取草稿列表 | `/cgi-bin/draft/batchget` | 获取草稿列表 |
 | 删除草稿 | `/cgi-bin/draft/delete` | 删除指定草稿 |
@@ -46,6 +49,62 @@ media: 图片文件
   "url": "http://mmbiz.qpic.cn/..."
 }
 ```
+
+---
+
+## 上传图文消息内的图片获取URL
+
+> 用于把图片放进文章正文 HTML 的 `<img>` 标签里。
+>
+> 与「上传永久素材」的区别：本接口返回 `url`（不是 `media_id`），且**不占公众号 10 万永久素材额度**；仅供正文 `<img>` 使用，不能作为 `thumb_media_id`。
+>
+> 官方文档：<https://developers.weixin.qq.com/doc/subscription/api/notify/message/api_uploadimage.html>
+
+**请求：**
+```
+POST https://api.weixin.qq.com/cgi-bin/media/uploadimg?access_token=ACCESS_TOKEN
+Content-Type: multipart/form-data
+
+media: 图片文件（JPG/PNG，≤1MB）
+```
+
+**返回：**
+```json
+{
+  "url": "http://mmbiz.qpic.cn/mmbiz_png/XXXXX",
+  "errcode": 0,
+  "errmsg": "ok"
+}
+```
+
+**字段说明：**
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| url | string | 可直接放在正文 `<img src="...">` 中的永久 URL |
+| errcode | number | 错误码，0 表示成功 |
+| errmsg | string | 错误信息 |
+
+**限制：**
+
+- 仅支持 JPG、PNG 格式
+- 文件大小 ≤1MB
+- 上传后图片永久有效
+- **不计入**公众号 10 万永久素材的额度
+
+**使用方式（配套脚本 `scripts/upload_content_image.sh`）：**
+
+```bash
+RESP=$(./scripts/upload_content_image.sh "$TOKEN" /path/to/local_image.jpg)
+URL=$(echo "$RESP" | jq -r '.url')
+
+# 然后将 URL 插入到正文 HTML 的 <img> 标签里
+./scripts/insert_content_image.py \
+  --input article.html --output article_with_img.html \
+  --url "$URL" --after-paragraph 3
+```
+
+> ⚠️ 微信公众号规定：正文中的图片 url 必须来自本接口，**外部图片 url 会被过滤掉**。
 
 ---
 
@@ -107,7 +166,9 @@ Content-Type: application/json
 |--------|------|----------|
 | 40001 | access_token 过期或无效 | 重新获取 |
 | 40002 | token 错误 | 检查 token 是否正确 |
+| 40005 | 文件类型非法（uploadimg） | 仅支持 JPG/PNG |
 | 40007 | media_id 无效 | 检查封面图是否正确上传 |
+| 40009 | 图片尺寸非法（uploadimg） | 压缩图片至 ≤1MB |
 | 40013 | appid 无效 | 检查 AppID |
 | 40164 | IP 不在白名单 | 添加 IP 到白名单 |
 | 44002 | POST 数据为空 | 检查请求体 |
@@ -123,7 +184,7 @@ Content-Type: application/json
 - `<br>` - 换行
 - `<section>` - 区块
 - `<div>` - 容器
-- `<img>` - 图片（需先上传获取 media_id）
+- `<img>` - 图片（需先通过 `uploadimg` 接口上传获取 url，外部 url 会被过滤）
 - `<strong>`, `<b>` - 加粗
 - `<em>`, `<i>` - 斜体
 - `<span style="...">` - 行内样式
@@ -147,5 +208,8 @@ Content-Type: application/json
 1. **thumb_media_id 必填**：封面图片必须通过 `add_material` 接口上传获取
 2. **HTML 转义**：content 中的特殊字符需要转义
 3. **换行处理**：JSON 中不能包含原始换行符，需替换为空格
-4. **图片限制**：正文中图片需使用永久素材 media_id
+4. **图片限制**：
+   - 封面图通过 `add_material` 上传，返回 `media_id`
+   - 正文图片通过 `media/uploadimg` 上传，返回 `url`，外部图片 url 会被过滤
 5. **频率限制**：注意接口调用频率，避免被封
+6. **正文限制**：HTML 内容 ≤2万字符、<1MB；JS 会被去除；图文中商品个数 ≤50
