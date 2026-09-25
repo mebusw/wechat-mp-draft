@@ -74,6 +74,15 @@ description: 代写微信公众号文章并保存到公众号草稿箱。使用�
 
 输出形如 `图片URL: https://...`，记录备用。
 
+> **批量时格式不同（实测 2026-09-24）**：用 `hunyuan3-batch.py` 串行批量出图时，日志里打印的是
+> `  URL=['https://aiart-...cos.ap-guangzhou.myqcloud.com/...']`（Python list repr 的 str()），
+> 不是 `图片URL:`。解析正则用：
+> ```python
+> re.search(r"URL=\[?['\"]?(https://[^\s'\"]+)", line)
+> ```
+> 注意别写成 `URL=\[?'?(\S+?)'?\]?` —— `(\S+?)` 惰性 + 两个 `?` 可选后缀会只匹配到 1 个字符，
+> 下载出 0 字节文件且 curl 不报错，很容易被误判为"链接失效"。
+
 #### 4.2 下载到本地（临时 URL 1 小时后过期，必须立刻下载）
 
 ```bash
@@ -261,6 +270,50 @@ CONTENT='<p>这里是文章内容...</p>'
 7. **草稿 `media_id` 在用户后台操作后立即失效**：`draft/update` 链路只在「同一会话、刚 add 完、用户未介入」时可靠；间隔较长或不确定时，先 `batchget` 再决定 update 还是 add。
 8. **标题分离**（核心约定）：标题**只**作为 `title` 参数传入，**不允许**以 `<h1>` 形式留在 body 里。`/jackyshen-write-wechat-article` 输出的 markdown 第一行 `# 标题` 既是标题来源，也必须被剔除。`add_draft.sh` 会自动剥离 body 开头的 `<h1>`（即使嵌在 `<section id="nice">` 包装里），但更稳妥的做法是**渲染前手动从 markdown 中删除 `# 标题` 行**。详见「问题 5」。
 9. **正文图片 url 必须来自 `media/uploadimg`**，外部图片 url 会被微信过滤
+10. **2 万字符是硬限制，且渲染后极易超出**：`wechat-markdown-html-render` 的输出**没有 `<style>` 块**，样式全部内联在元素的 `style` 属性里（实测占 71%）。一篇 ~2800 字的 md 渲染后 22.5k 字符，直接提交会被拒。无损压缩 recipe（视觉不变，实测 22538 → 19314）：
+    ```python
+    import re
+    h = re.sub(r'\s+data-tool="[^"]*"', '', h)                                  # 去掉 mdnice 元信息属性
+    h = re.sub(r'padding-top: 8px; padding-bottom: 8px;', 'padding: 8px 0;', h) # 合并等价写法
+    h = re.sub(r'word-spacing: 0px; letter-spacing: 0px;', '', h)
+    h = re.sub(r'word-break: break-all;', '', h)
+    ```
+    插入 2 张正文图会再增加约 500 字符，压缩时要留余量。
+
+    **实测（2026-09-24，6 篇批量发布）：上面的基础 recipe 只减 14%，对 3000+ 字的长文不够用。**
+    markup（内联 style）占总体积 ~83%，真正的空间在那里。在基础 recipe 之上再叠加下面这组
+    **视觉等价替换**（把冗余属性删掉：font-size/line-height/text-align 从 `<section id="nice">` 继承，
+    padding:0px 无意义），实测减重 **45%**，且渲染结果肉眼无差异：
+
+    ```python
+    # <p> 74→44 字符（font-size/line-height 已由外层 section 继承）
+    (r'<p style="font-size: 16px; padding: 8px 0; margin: 0; line-height: 26px; color: #666;">',
+     '<p style="padding:8px 0;margin:0;color:#666;">'),
+    (r'<p style="font-size: 16px; padding: 8px 0; margin: 0px; line-height: 26px; color: #999; padding: 3px 0;">',
+     '<p style="padding:3px 0;margin:0;color:#999;">'),
+    # <li> 75→18 字符
+    (r'<li style="line-height: 26px; text-align: left; color: rgb\(1,1,1\); font-weight: 500">',
+     '<li style="color:rgb(1,1,1)">'),
+    # 标题装饰 span：prefix 是 display:none 的废节点，suffix 是空节点，content 的 border 与 h2 自身重复
+    (r'<span class="prefix" style="display: none;"></span>', ''),
+    (r'<span class="suffix"></span>', ''),
+    (r'<span class="content" style="border-bottom: 1px solid hsl\(216, 100%, 68%\);">', '<span>'),
+    # 标题 / 列表 / 引用块 的等价简写
+    (r'<h2 style="margin-top: 30px; margin-bottom: 15px; padding: 0px; font-weight: normal; color: #333; font-size: 1\.4em; border-bottom: 1px solid hsl\(216, 100%, 68%\);">',
+     '<h2 style="margin:30px 0 15px;font-weight:normal;color:#333;font-size:1.4em;border-bottom:1px solid hsl(216,100%,68%);">'),
+    (r'<h3 style="margin-top: 25px; margin-bottom: 12px; padding: 0px; font-weight: normal; color: #333; font-size: 1\.2em;">',
+     '<h3 style="margin:25px 0 12px;font-weight:normal;color:#333;font-size:1.2em;">'),
+    (r'<ul style="margin-top: 8px; margin-bottom: 8px; color: black; list-style-type: disc; padding-left: 2em;">',
+     '<ul style="margin:8px 0;padding-left:2em;list-style-type:disc;">'),
+    (r'<ol style="margin-top: 8px; margin-bottom: 8px; color: black; list-style-type: decimal; padding-left: 2em;">',
+     '<ol style="margin:8px 0;padding-left:2em;list-style-type:decimal;">'),
+    (r'<blockquote style="display: block; font-size: 0\.9em; overflow: auto; overflow-scrolling: touch; border-left: 3px solid rgba\(0, 0, 0, 0\.4\); color: #6a737d; padding-top: 10px; padding-bottom: 10px; padding-left: 20px; padding-right: 10px; margin-bottom: 20px; margin-top: 20px; background: #f9f9f9; border-left-color: hsl\(216, 100%, 68%\);">',
+     '<blockquote style="font-size:.9em;border-left:3px solid hsl(216,100%,68%);color:#6a737d;padding:10px 10px 10px 20px;margin:20px 0;background:#f9f9f9;">'),
+    ```
+
+    实测 6 篇：30198→16662、22214→12501、18266→10471、17794→10087、17323→10317、9348→5280。
+    **注意顺序**：先跑基础 recipe，再跑上面的替换（基础 recipe 生成的 `padding: 8px 0;` 是上面 `<p>` 规则的匹配前提）。
+11. **配图分辨率（huny-img 实测）**：比例字符串（`16:9`、`2.35:1`）会被 API 以 `InvalidParameter` 拒绝，**必须传像素**；`2.35:1` 的封面不要用 `1024:436`（短边 <512 被拒），用 `1203:512`。正文图 `1280:720` 可用，但生成的是 PNG 约 2.7MB，**超过 `uploadimg` 的 1MB 上限**，需先转 JPEG：`sips -s format jpeg -s formatOptions 72 in.png --out out.jpg`（约 100KB）。
 
 ## 文件结构
 
