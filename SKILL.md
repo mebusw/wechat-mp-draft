@@ -92,11 +92,18 @@ curl -s -o /tmp/content_img_1.jpg "<huny-img 返回的临时 URL>"
 #### 4.3 调用 `upload_content_image.sh` 上传到微信（获取正文可用 URL）
 
 ```bash
-RESP=$(./scripts/upload_content_image.sh "$TOKEN" /tmp/content_img_1.jpg)
+RESP=$(./scripts/upload_content_image.sh "$TOKEN" /tmp/content_img_1.jpg | tail -1)
 URL_1=$(echo "$RESP" | jq -r '.url')
 ```
 
 > 与 `upload_image.sh`（封面永久素材）的区别：本接口返回 `url` 字段（不是 `media_id`），且**不占公众号 10 万永久素材额度**。仅支持 JPG/PNG，文件 ≤1MB。
+
+> ⚠️ **拿到 URL 后必须还原 JSON 转义**（实测 2026-10-02 踩坑）：如果不用 `jq` 而是用
+> `grep -o '"url":"[^"]*"'` / `sed` 之类从原始输出里抠 URL，拿到的是**仍带反斜杠的**
+> `http:\/\/mmbiz.qpic.cn\/...`。把它直接写进 `<img src="...">` 后，微信取不到图——
+> 后台看正文像"没插图"，但 `<img>` 标签其实在（`draft/get` 能查到）。
+> 用 `jq -r` 会自动还原转义，是**首选**；若必须手工抠，记得 `s.replace('\\/','/')`。
+> 自检：插入前 `grep -o '<img src="[^"]*"' article.html`，URL 里**不允许**出现 `\`。
 
 重复 4.1–4.3 得到第二张图的 `URL_2`。
 
@@ -141,6 +148,22 @@ EOF
 FINAL_CONTENT=$(cat article_final.html)
 ./scripts/add_draft.sh "$TOKEN" "标题" "$FINAL_CONTENT" "$THUMB_ID" "作者" "摘要"
 ```
+
+#### 4.6 必做：回查草稿确认图片真的进去了
+
+发完别急着报成功。`draft/add` 返回 `media_id` **只代表入库**，不代表图片可用。
+用 `draft/get` 回查，核对 `<img>` 数量与 URL：
+
+```bash
+curl -s -X POST "https://api.weixin.qq.com/cgi-bin/draft/get?access_token=$TOKEN" \
+  -H "Content-Type: application/json" -d "{\"media_id\":\"$MEDIA_ID\"}" \
+| python3 -c "import json,sys,re;c=json.load(sys.stdin)['news_item'][0]['content'];\
+print(len(re.findall(r'<img',c)));[print(m[:90]) for m in re.findall(r'<img[^>]*>',c)]"
+```
+
+- 正常：数量 = 预期张数，URL 以 `https://mmbiz.qpic.cn/...` 开头。
+- 微信会把 `src` 改写成 `data-src`（编辑器懒加载，属正常，不是丢图）。
+- 数量对但图不显示 → 多半是 4.3 的转义问题，见下文「问题 6」。
 
 ## 关键问题与解决方案
 
@@ -204,14 +227,31 @@ FINAL_CONTENT=$(cat article_final.html)
 
 **辨别脚本是否真的没剥离：** `add_draft.sh` 输出的 JSON payload 里搜 `<h1` —— 应该是 0 次。
 
+### ❌ 问题 6：正文看起来「没插图」，但 `<img>` 标签其实在
+
+**症状：** 草稿保存成功、`draft/get` 也能查到 `<img>`，但公众号后台/预览里图片不显示，正文像纯文字。
+
+**根因：** 图片 URL 里残留了 JSON 转义的反斜杠 —— `http:\/\/mmbiz.qpic.cn\/...`。
+`upload_content_image.sh` 的原始输出是 JSON，URL 中的 `/` 被写成 `\/`。用 `jq -r` 取会自动还原，
+但用 `grep -o '"url":"[^"]*"' | sed` 手工抠出来的是**未还原**的字符串，直接拼进 `<img src="...">`
+后浏览器/微信无法解析，静默失败（不报错、不占位）。
+
+**排查：** `grep -o '<img src="[^"]*"' article_final.html` —— URL 里只要出现 `\` 就是这个问题。
+
+**修复：**
+```python
+html = html.replace('\\/', '/')   # 或一开始就用 jq -r '.url' 取值
+```
+然后用 `draft/update`（media_id 未失效）或重新 `draft/add` 覆盖。
+
 ## 完整使用示例
 
 ```bash
 # 1. 获取 token
-TOKEN=$(./scripts/get_access_token.sh | jq -r '.access_token')
+TOKEN=$(./scripts/get_access_token.sh | tail -1 | jq -r '.access_token')
 
 # 2. 上传封面图
-THUMB_RESPONSE=$(./scripts/upload_image.sh "$TOKEN" /path/to/cover.jpg)
+THUMB_RESPONSE=$(./scripts/upload_image.sh "$TOKEN" /path/to/cover.jpg | tail -1)
 THUMB_ID=$(echo "$THUMB_RESPONSE" | jq -r '.media_id')
 
 # 3. 准备文章内容（HTML 格式，body 不能含 <h1>，见「问题 5」）
@@ -314,6 +354,8 @@ CONTENT='<p>这里是文章内容...</p>'
     实测 6 篇：30198→16662、22214→12501、18266→10471、17794→10087、17323→10317、9348→5280。
     **注意顺序**：先跑基础 recipe，再跑上面的替换（基础 recipe 生成的 `padding: 8px 0;` 是上面 `<p>` 规则的匹配前提）。
 11. **配图分辨率（huny-img 实测）**：比例字符串（`16:9`、`2.35:1`）会被 API 以 `InvalidParameter` 拒绝，**必须传像素**；`2.35:1` 的封面不要用 `1024:436`（短边 <512 被拒），用 `1203:512`。正文图 `1280:720` 可用，但生成的是 PNG 约 2.7MB，**超过 `uploadimg` 的 1MB 上限**，需先转 JPEG：`sips -s format jpeg -s formatOptions 72 in.png --out out.jpg`（约 100KB）。
+12. **脚本输出混了状态行，取字段必须 `| tail -1 | jq`**：`get_access_token.sh`、`upload_image.sh`、`upload_content_image.sh` 都会先打印「✅ xxx 成功」这类中文状态行，再打印 JSON。直接 `| jq -r '.xxx'` 会报 `parse error: Invalid numeric literal`，必须用 `| tail -1 | jq -r '...'`（本文件里所有示例已按此写法修正）。
+13. **IP 白名单生效有延迟**：出口 IP 变化后调用 `cgi-bin/token` 会返回 `40164`，在公众号后台添加 IP 后**约 8 分钟才生效**，刚加完立刻重试仍会失败，别误判为加错了地方。沙箱环境里 `env -u HTTP_PROXY...` 直连与换 ClashX 代理都改不了出口 IP（实测两者出口 IP 相同），只能走白名单。
 
 ## 文件结构
 
