@@ -1,6 +1,6 @@
 ---
 name: wechat-mp-draft
-description: 代写微信公众号文章并保存到公众号草稿箱。使用场景：用户需要撰写公众号文章并直接发布到微信公众号后台草稿箱；或排查公众号草稿箱里的「标题在文章顶部重复显示两次」「标题行既出现在 title 字段又出现在 body」等 markdown-renderer 标题重复问题。触发词："写公众号文章"、"保存到公众号草稿"、"微信文章"、"公众号发文"、"标题重复"、"草稿标题显示两次"。
+description: 代写微信公众号文章并保存到公众号草稿箱（每篇正文配图不少于 4 张）。使用场景：用户需要撰写公众号文章并直接发布到微信公众号后台草稿箱；或排查公众号草稿箱里的「标题在文章顶部重复显示两次」「标题行既出现在 title 字段又出现在 body」等 markdown-renderer 标题重复问题。触发词："写公众号文章"、"保存到公众号草稿"、"微信文章"、"公众号发文"、"标题重复"、"草稿标题显示两次"。
 ---
 
 # 微信公众号草稿 Skill
@@ -12,7 +12,7 @@ description: 代写微信公众号文章并保存到公众号草稿箱。使用�
 2. **从 markdown 中删除首行 `# 标题`**，避免标题在 body 里重复显示（详见「问题 5」）
 3. 调用SKILL `/wechat-markdown-html-render` 来分别渲染文本和代码样式，得到html格式的输出文件。
 4. 调用SKILL `/huny-img` 或其他任何可用的文生图片(image generation)SKILL来配**1张封面图**（ar 2.35:1）
-5. 调用SKILL `/huny-img` 或其他任何可用的文生图片(image generation)SKILL来生成 **2 张新生成的内容图片**，然后插入渲染后的正文 HTML 中。位置一般在头部一张（为了尽早吸引读者兴趣），中部一张（让读者保持兴趣继续读），具体位置和图片主题由 AI 根据文章内容来建议。
+5. 调用SKILL `/huny-img` 或其他任何可用的文生图片(image generation)SKILL来生成 **至少 4 张内容图片**，然后插入渲染后的正文 HTML 中。位置分布建议：头部一张（尽早吸引读者兴趣）、中前段一张、中后段一张、结尾收束前一张（让读者能读到最后）。具体位置和图片主题由 AI 根据文章内容来决定。**正文图不得少于 4 张**（不含封面）。
 6. 继续调用本SKILL的工作流程来访问微信公众号文章草稿箱，标题作为 `title` 参数传入，body 只包含正文（`add_draft.sh` 也会自动剥离 body 开头 H1 作为最后一道防线）
 
 
@@ -60,7 +60,10 @@ description: 代写微信公众号文章并保存到公众号草稿箱。使用�
 ./scripts/add_draft.sh <access_token> <标题> <HTML内容> <thumb_media_id> [AUTHOR] [摘要]
 ```
 
-### 4. 在正文 HTML 中插入 2 张新生成的内容图片
+### 4. 在正文 HTML 中插入至少 4 张新生成的内容图片
+
+> **数量下限：正文图 ≥ 4 张**（不含封面）。每张图都要独立走完 4.1 → 4.2 → 4.3：混元生图 → 下载到本地 → 换成微信永久 URL → 插入正文。
+> 少于 4 张会被判为配图不足：读者在长文里滑动时没有视觉锚点，中段容易划走。
 
 > **为什么必须用本接口**：微信规定正文里的图片 url 必须来自 `cgi-bin/media/uploadimg`，外部图片 url 会被过滤掉。本步骤会调 `/huny-img` 生图 → 下载到本地 → 上传获取永久 URL → 按 AI 建议位置插入 HTML。
 
@@ -105,11 +108,19 @@ URL_1=$(echo "$RESP" | jq -r '.url')
 > 用 `jq -r` 会自动还原转义，是**首选**；若必须手工抠，记得 `s.replace('\\/','/')`。
 > 自检：插入前 `grep -o '<img src="[^"]*"' article.html`，URL 里**不允许**出现 `\`。
 
-重复 4.1–4.3 得到第二张图的 `URL_2`。
+> ⚠️ **混元的临时 URL 绝对不能直接写进 `<img src>`**（实测 2026-10-24 踩坑，症状极隐蔽）：
+> `aiart-*.cos.ap-guangzhou.myqcloud.com` 是 1 小时失效的**外链**地址，微信会把它当外链**静默过滤掉**——
+> 本地 HTML 里明明 4 张图，草稿里却只剩 2 张（还是上一轮的旧图），`draft/get` 查出来数量也不对。
+> 逐张走 4.3 换成 `mmbiz.qpic.cn` 永久 URL 再插入；插入后必查：
+> ```bash
+> grep -o '<img src="[^"]*"' article_final.html | grep -v 'mmbiz.qpic.cn'   # 必须为空
+> ```
+
+重复 4.1–4.3，得到第 2 / 3 / 4 张的 `URL_2`、`URL_3`、`URL_4`。**每张都要单独上传**——混元的临时 URL 不可复用，也不可直接插入。
 
 #### 4.4 用 `insert_content_image.py` 按 AI 建议的位置插入到 HTML
 
-AI 先通读 HTML，挑选 2 个插入点（一般在文章中部、与上下文自然衔接处），可用以下任一方式指定：
+AI 先通读 HTML，挑选 **4 个**插入点（覆盖头部 / 中前段 / 中后段 / 结尾收束前），每个插入点要与上下文自然衔接，可用以下任一方式指定：
 
 **单张插入（命令行）**
 
@@ -131,7 +142,9 @@ AI 先通读 HTML，挑选 2 个插入点（一般在文章中部、与上下文
 cat > /tmp/img_spec.json <<EOF
 [
   {"url": "$URL_1", "after_paragraph": 3},
-  {"url": "$URL_2", "after_marker": "<h2>核心观点</h2>"}
+  {"url": "$URL_2", "after_marker": "<h2>核心观点</h2>"},
+  {"url": "$URL_3", "after_paragraph": 12},
+  {"url": "$URL_4", "after_marker": "<h2>写在最后</h2>"}
 ]
 EOF
 
@@ -161,7 +174,8 @@ curl -s -X POST "https://api.weixin.qq.com/cgi-bin/draft/get?access_token=$TOKEN
 print(len(re.findall(r'<img',c)));[print(m[:90]) for m in re.findall(r'<img[^>]*>',c)]"
 ```
 
-- 正常：数量 = 预期张数，URL 以 `https://mmbiz.qpic.cn/...` 开头。
+- 正常：数量 = 预期张数（**≥ 4**），URL 以 `https://mmbiz.qpic.cn/...` 开头。
+- 数量少于预期 → 多半是混元临时 URL 没换永久链接（见 4.3 补注）或 URL 带转义反斜杠；先跑 `grep -v 'mmbiz.qpic.cn'` 自检。
 - 微信会把 `src` 改写成 `data-src`（编辑器懒加载，属正常，不是丢图）。
 - 数量对但图不显示 → 多半是 4.3 的转义问题，见下文「问题 6」。
 
@@ -244,6 +258,46 @@ html = html.replace('\\/', '/')   # 或一开始就用 jq -r '.url' 取值
 ```
 然后用 `draft/update`（media_id 未失效）或重新 `draft/add` 覆盖。
 
+### ❌ 问题 7：配图数量不足 4 张 / 改稿时草稿更新失败
+
+**症状 A：草稿里的图比本地少。** 本地 HTML 4 张图，`draft/get` 只剩 2 张（甚至是上一轮的旧图）。
+**根因：** 混元给的是 `aiart-*.cos.ap-guangzhou.myqcloud.com` 临时外链，微信**静默过滤**外链图片。
+**解决：** 每张图必须先 `upload_content_image.sh` 换成 `mmbiz.qpic.cn` 永久 URL 再插入（见 4.3）；插入后 `grep -v 'mmbiz.qpic.cn'` 自检必须为空。
+
+**症状 B：`draft/update` 返回 47001（数据格式错误）。**
+**根因：** 正文里带单引号（`font-family: 'PingFang SC'`）时，经 shell 引号拼 JSON 会被截断。
+**解决：** 把 JSON 写进文件再传参，正文里的换行符替换成空格：
+```bash
+python3 - << 'PY'
+import json, io
+html = io.open("article_final.html", encoding="utf-8").read().replace("\n", " ")
+payload = {"articles": [{"title": "标题", "author": "作者", "digest": "摘要",
+                        "content": html, "content_source_url": "",
+                        "thumb_media_id": THUMB_ID, "need_open_comment": 1,
+                        "only_fans_can_comment": 0, "show_cover_pic": 0}]}
+io.open("payload.json", "w", encoding="utf-8").write(json.dumps(payload, ensure_ascii=False))
+PY
+curl -s -X POST "https://api.weixin.qq.com/cgi-bin/draft/update?access_token=$TOKEN" \
+  -H "Content-Type: application/json" -d @payload.json
+```
+> 同理，`draft/add` 也要用文件传参；`add_draft.sh` 用的是 `"$CONTENT"` 位置参数，正文太长时也可能被 shell 截断 —— 正文超过 1 万字符时改走 payload 文件。
+
+**症状 C：`draft/add` 报 40007 invalid media_id，但封面明明传了。**
+**根因：** 封面 `thumb_media_id` 无效。常见原因是按名字查素材时用了错方法：`material/batchget_material` **必须用 POST**（GET 返回 43002），查不到就重复上传，素材库里堆一堆同名图。
+**解决：** 用 POST 查素材库复用已有封面：
+```bash
+curl -s -X POST "https://api.weixin.qq.com/cgi-bin/material/batchget_material?access_token=$TOKEN" \
+  -H "Content-Type: application/json" -d '{"type":"image","count":20,"offset":0}'
+```
+
+**症状 D：改稿后草稿箱里出现两份。**
+**根因：** `draft/update` 失败后改走 `draft/add`，旧草稿没删。
+**解决：** 重建后立刻删旧的（删不掉说明它已失效，那也正常）：
+```bash
+curl -s -X POST "https://api.weixin.qq.com/cgi-bin/draft/delete?access_token=$TOKEN" \
+  -H "Content-Type: application/json" -d '{"media_id":"旧MEDIA_ID"}'
+```
+
 ## 完整使用示例
 
 ```bash
@@ -309,7 +363,8 @@ CONTENT='<p>这里是文章内容...</p>'
 6. **OL/UL 列表会被公众号编辑器篡改**：`add_draft.sh` 已内置 sanitizer 自动 strip 列表内空白；若用其他渠道上传，必须确保 `<li>` 内**不嵌套块级元素**（特别是 `<section>`），并且 `<ol>/<ul>` 与 `<li>` 之间、`<li>` 兄弟之间**零空白**。详见「问题 4」。
 7. **草稿 `media_id` 在用户后台操作后立即失效**：`draft/update` 链路只在「同一会话、刚 add 完、用户未介入」时可靠；间隔较长或不确定时，先 `batchget` 再决定 update 还是 add。
 8. **标题分离**（核心约定）：标题**只**作为 `title` 参数传入，**不允许**以 `<h1>` 形式留在 body 里。`/jackyshen-write-wechat-article` 输出的 markdown 第一行 `# 标题` 既是标题来源，也必须被剔除。`add_draft.sh` 会自动剥离 body 开头的 `<h1>`（即使嵌在 `<section id="nice">` 包装里），但更稳妥的做法是**渲染前手动从 markdown 中删除 `# 标题` 行**。详见「问题 5」。
-9. **正文图片 url 必须来自 `media/uploadimg`**，外部图片 url 会被微信过滤
+9. **正文图片 url 必须来自 `media/uploadimg`**，外部图片 url 会被微信过滤（混元临时链接也会被过滤，见 4.3 补注）
+9.1 **每篇正文至少 4 张图**：正文图数量下限是 4 张（不含封面），插入点要覆盖头部 / 中前段 / 中后段 / 结尾收束前
 10. **2 万字符是硬限制，且渲染后极易超出**：`wechat-markdown-html-render` 的输出**没有 `<style>` 块**，样式全部内联在元素的 `style` 属性里（实测占 71%）。一篇 ~2800 字的 md 渲染后 22.5k 字符，直接提交会被拒。无损压缩 recipe（视觉不变，实测 22538 → 19314）：
     ```python
     import re
@@ -318,7 +373,7 @@ CONTENT='<p>这里是文章内容...</p>'
     h = re.sub(r'word-spacing: 0px; letter-spacing: 0px;', '', h)
     h = re.sub(r'word-break: break-all;', '', h)
     ```
-    插入 2 张正文图会再增加约 500 字符，压缩时要留余量。
+    插入 4 张正文图会再增加约 900 字符（每张约 220 字符），压缩时要留余量。
 
     **实测（2026-09-24，6 篇批量发布）：上面的基础 recipe 只减 14%，对 3000+ 字的长文不够用。**
     markup（内联 style）占总体积 ~83%，真正的空间在那里。在基础 recipe 之上再叠加下面这组
