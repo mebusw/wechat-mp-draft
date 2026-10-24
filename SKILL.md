@@ -298,6 +298,34 @@ curl -s -X POST "https://api.weixin.qq.com/cgi-bin/draft/delete?access_token=$TO
   -H "Content-Type: application/json" -d '{"media_id":"旧MEDIA_ID"}'
 ```
 
+### ❌ 问题 8：清理素材库时把草稿一起删没了
+
+**症状：** 清理重复封面素材后，草稿箱里的文章少了；或删完素材再 `draft/get` 报 40007。
+
+**根因：** 两件事叠加——
+1. **用户在后台打开/编辑过草稿后，WeChat 会重新上传封面**，`thumb_media_id` 就变了（草稿 `media_id` 不变）。
+   拿旧的 `thumb_media_id` 去判断「这个素材还有没有人用」，会误判成孤儿。
+2. **删除被草稿引用的永久素材，会连带把草稿删掉** —— 草稿的封面就是那个素材。
+
+**解决：** 清理前先取当前真实引用关系，只删真正的孤儿：
+```bash
+# 1) 取所有草稿当前的 thumb_media_id
+curl -s -X POST "https://api.weixin.qq.com/cgi-bin/draft/batchget?access_token=$TOKEN" \
+  -H "Content-Type: application/json" -d '{"offset":0,"count":30,"no_content":0}' \
+| python3 -c "import json,sys;[print(i['content']['news_item'][0]['thumb_media_id']) for i in json.load(sys.stdin)['item']]"
+
+# 2) 素材库按名字分组（注意 batchget_material 必须 POST）
+curl -s -X POST "https://api.weixin.qq.com/cgi-bin/material/batchget_material?access_token=$TOKEN" \
+  -H "Content-Type: application/json" -d '{"type":"image","count":20,"offset":0}'
+
+# 3) 只删「不在上面那组 id 里」的同名素材；删完立刻 batchget 复核草稿数量
+```
+> 更稳的做法：**先删草稿、再删素材**；或先备份草稿内容（本地留一份 final.html），万一被连带删掉可以一键重建
+> （正文图的 `mmbiz.qpic.cn` 链接不会因删素材而失效，只有封面需要重传）。
+
+**症状 E：草稿「自己不见了」。** 后台编辑过、或者本地记录过久的草稿，可能已经不在 `batchget` 列表里。
+**处理：** 以 `batchget` 的实时结果为准，不要依赖之前记下的 `media_id`；本地保留每篇的 final.html + 配图，可随时重建。
+
 ## 完整使用示例
 
 ```bash
