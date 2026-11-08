@@ -1,8 +1,17 @@
 #!/bin/bash
 # 保存文章到微信公众号草稿箱
+#
 # 使用方法: ./add_draft.sh <access_token> <title> <content> <thumb_media_id> [author] [digest]
+#
+# ⚠️ 本脚本在本机调用微信 API，要求**本机出口 IP 在公众号白名单里**。
+#    本机 IP 常变时，改用 scripts/remote_publish.py —— 由固定 IP 的服务器发稿。
+#
+# 预处理（标题去重 / 列表清洗）已抽到 wechat_html.py，与远程发布共用同一套逻辑，
+# 保证本地发布与远程发布的正文完全一致。
 
 set -e
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 ACCESS_TOKEN=$1
 TITLE=$2
@@ -11,7 +20,6 @@ THUMB_MEDIA_ID=$4
 AUTHOR=${5:-""}
 DIGEST=${6:-""}
 
-# 参数检查
 if [ -z "$ACCESS_TOKEN" ] || [ -z "$TITLE" ] || [ -z "$CONTENT" ] || [ -z "$THUMB_MEDIA_ID" ]; then
     echo "错误：缺少必填参数"
     echo "用法: $0 <access_token> <title> <content> <thumb_media_id> [author] [digest]"
@@ -26,136 +34,73 @@ if [ -z "$ACCESS_TOKEN" ] || [ -z "$TITLE" ] || [ -z "$CONTENT" ] || [ -z "$THUM
     exit 1
 fi
 
-# 检查 jq 是否安装
 if ! command -v jq &> /dev/null; then
     echo "错误：需要安装 jq 工具"
     echo "安装命令: apt-get install jq"
     exit 1
 fi
 
-# 检查 python3 是否可用（用于 HTML normalization + 自检）
 if ! command -v python3 &> /dev/null; then
     echo "错误：需要 python3（用于 WeChat HTML normalization）"
     exit 1
 fi
 
 # ---------------------------------------------------------------------------
-# WeChat MP editor list normalization — defensive sanitizer.
-#
-# Mirrors the post-processing built into wechat-markdown-html-render. Re-applied
-# here as defense-in-depth because content may be hand-written, copy-pasted, or
-# routed through a pretty-printer that re-introduces inter-<li> whitespace
-# between rendering and publishing — both symptoms produce silently broken
-# ordered lists in the published article. See SKILL.md "Troubleshooting" for
-# the underlying MP editor quirks.
+# WeChat MP editor normalization — 标题去重 + 列表清洗
 # ---------------------------------------------------------------------------
-SANITIZED=$(printf '%s' "$CONTENT" | python3 -c '
-import re, sys, json
-html = sys.stdin.read()
-title = sys.argv[1] if len(sys.argv) > 1 else ""
-
-# 0. Strip a leading <h1>...</h1> from the body. The article title is already
-#    passed as the `title` field, and the WeChat MP editor renders that title
-#    at the top of the article. If the body still contains the same H1
-#    (because the source markdown started with `# Title`), the title appears
-#    twice — once as the article header, once inside the body. We strip
-#    unconditionally; section headings inside the body should be H2+.
+# 1) 标题只走 title 字段：正文开头的 <h1> 必须剥离，否则文章顶部会出现两次标题。
+#    markdown 渲染器会把整篇包在 <section id="nice"> 里，H1 往往是这个包装的
+#    第一个子元素，所以正则允许一个可选的 <section|div> 开标签。
 #
-#    The markdown renderer wraps everything in <section id="nice" ...> for
-#    styling, so the H1 may be the FIRST CHILD of that wrapper rather than
-#    the literal first token. Allow an optional leading <section|div> opener
-#    before the H1 (the matching </section> stays intact and remains a valid
-#    empty container).
-stripped_h1_text = None
-m = re.match(
-    r"\s*(?:<(?:section|div)\b[^>]*>\s*)?<h1\b[^>]*>(.*?)</h1>\s*",
-    html, flags=re.I | re.S,
-)
-if m:
-    inner = m.group(1)
-    stripped_h1_text = re.sub(r"<[^>]+>", "", inner).strip()
-    html = html[m.end():]
+# 2) 公众号编辑器会把 <ol>/<ul> 里的空白文本节点当成额外的空 <li>，
+#    导致编号错乱、列表项之间多出空行 —— 必须把列表内空白全部清掉。
+#
+# 详见 wechat_html.py 与 SKILL.md「关键问题与解决方案」。
+# ---------------------------------------------------------------------------
+TMP_IN=$(mktemp -t wechat_content_in.XXXXXX)
+TMP_OUT=$(mktemp -t wechat_content_out.XXXXXX)
+trap 'rm -f "$TMP_IN" "$TMP_OUT"' EXIT
 
-# 1. Strip whitespace between <ol>/<ul> and <li>, between sibling <li>s, and
-#    before the closing </ol>/</ul>. The MP editor treats those whitespace
-#    text nodes as additional empty list items.
-html = re.sub(r"(<(?:ol|ul)\b[^>]*>)\s+(<li\b)", r"\1\2", html, flags=re.I)
-html = re.sub(r"(</li>)\s+(<li\b)", r"\1\2", html, flags=re.I)
-html = re.sub(r"(</li>)\s+(</(?:ol|ul)>)", r"\1\2", html, flags=re.I)
+printf '%s' "$CONTENT" > "$TMP_IN"
+SANITIZE_JSON=$(python3 "$SCRIPT_DIR/wechat_html.py" sanitize "$TMP_IN" "$TMP_OUT")
+CONTENT=$(cat "$TMP_OUT")
 
-# Emit stripped-h1 info on a sentinel line so the shell side can pick it up.
-print("__H1_STRIPPED__" + json.dumps(stripped_h1_text, ensure_ascii=False))
-sys.stdout.write(html)
-' "$TITLE")
+H1_STRIPPED=$(printf '%s' "$SANITIZE_JSON" | jq -r '.h1_stripped_from_body // "null"')
+H1_MATCHES=$(printf '%s' "$SANITIZE_JSON" | jq -r --arg t "$TITLE" \
+    '(.h1_stripped_from_body // "") as $s | ($s != "" and $s == $t)')
 
-CONTENT="$SANITIZED"
-
-# Parse the H1-stripped sentinel from the python sanitizer output and keep
-# only the actual HTML body for downstream use.
-H1_STRIPPED_LINE=$(printf '%s\n' "$CONTENT" | grep -m1 '^__H1_STRIPPED__' || true)
-if [ -n "$H1_STRIPPED_LINE" ]; then
-    H1_STRIPPED=$(printf '%s' "$H1_STRIPPED_LINE" | sed 's/^__H1_STRIPPED__//')
-    CONTENT=$(printf '%s\n' "$CONTENT" | grep -v '^__H1_STRIPPED__' || true)
+if [ "$H1_STRIPPED" = "null" ] || [ -z "$H1_STRIPPED" ]; then
+    :
+elif [ "$H1_MATCHES" = "true" ]; then
+    echo "✅ 标题去重: body 顶部的 <h1> 已自动剥离（与 title 参数一致），避免重复显示"
 else
-    H1_STRIPPED="null"
+    echo "⚠️  body 顶部的 <h1>「$H1_STRIPPED」与 title 参数「$TITLE」不一致 —— 已剥离 body 的 H1，但请检查是否本意如此"
 fi
 
 # Pre-send self-check — abort if the payload still has the known anti-patterns,
 # so the user gets a clear error instead of a silently-broken article.
 CHECK=$(printf '%s' "$CONTENT" | python3 -c '
+import sys, json, os
+sys.path.insert(0, os.environ["SCRIPT_DIR"])
+import wechat_html
+print(json.dumps(wechat_html.self_check(sys.stdin.read()), ensure_ascii=False))
+' SCRIPT_DIR="$SCRIPT_DIR" 2>/dev/null || printf '%s' "$CONTENT" | python3 -c '
 import re, sys, json
 h = sys.stdin.read()
-li_count    = len(re.findall(r"<li\b[^>]*>", h, re.I))
-ol_count    = len(re.findall(r"<ol\b[^>]*>", h, re.I))
-ul_count    = len(re.findall(r"<ul\b[^>]*>", h, re.I))
-sec_in_li   = len(re.findall(r"<li\b[^>]*>\s*<section\b", h, re.I))
-gap_li_li   = len(re.findall(r"</li>\s+<li\b", h, re.I))
-gap_ol_li   = len(re.findall(r"<(?:ol|ul)\b[^>]*>\s+<li\b", h, re.I))
-gap_li_ol   = len(re.findall(r"</li>\s+</(?:ol|ul)>", h, re.I))
 print(json.dumps({
-    "li": li_count, "ol": ol_count, "ul": ul_count,
-    "section_in_li": sec_in_li,
-    "whitespace_between_li": gap_li_li,
-    "whitespace_ol_to_li":   gap_ol_li,
-    "whitespace_li_to_ol":   gap_li_ol,
+    "li": len(re.findall(r"<li\b[^>]*>", h, re.I)),
+    "section_in_li": len(re.findall(r"<li\b[^>]*>\s*<section\b", h, re.I)),
+    "whitespace_between_li": len(re.findall(r"</li>\s+<li\b", h, re.I)),
+    "whitespace_ol_to_li": len(re.findall(r"<(?:ol|ul)\b[^>]*>\s+<li\b", h, re.I)),
+    "whitespace_li_to_ol": len(re.findall(r"</li>\s+</(?:ol|ul)>", h, re.I)),
 }))
 ')
 echo "==> WeChat HTML self-check: $CHECK"
 
-# Report the H1 that was (or wasn't) stripped from the body. This is the
-# critical signal that prevents the "title appears twice" bug — the article
-# title is rendered by the WeChat editor from the `title` field, so a leading
-# H1 left in the body would duplicate it.
-H1_JSON=$(H1_STRIPPED="$H1_STRIPPED" TITLE="$TITLE" python3 -c '
-import json, os
-stripped = os.environ.get("H1_STRIPPED") or "null"
-if stripped and stripped != "null":
-    try:
-        stripped = json.loads(stripped)
-    except Exception:
-        pass
-title = os.environ.get("TITLE") or ""
-print(json.dumps({
-    "h1_stripped_from_body": stripped,
-    "matches_title_param": bool(stripped) and stripped == title,
-}, ensure_ascii=False))
-')
-echo "==> Title-h1 self-check: $H1_JSON"
-H1_STRIPPED_TEXT=$(echo "$H1_JSON" | jq -r '.h1_stripped_from_body')
-H1_MATCHES=$(echo "$H1_JSON" | jq -r '.matches_title_param')
-if [ "$H1_STRIPPED_TEXT" = "null" ] || [ -z "$H1_STRIPPED_TEXT" ]; then
-    # No leading <h1> in the body — nothing to do, no message needed.
-    :
-elif [ "$H1_MATCHES" = "true" ]; then
-    echo "✅ 标题去重: body 顶部的 <h1> 已自动剥离（与 title 参数一致），避免重复显示"
-else
-    echo "⚠️  body 顶部的 <h1>「$H1_STRIPPED_TEXT」与 title 参数「$TITLE」不一致 —— 已剥离 body 的 H1，但请检查是否本意如此"
-fi
-
-SEC_IN_LI=$(echo "$CHECK" | jq -r '.section_in_li')
-WS_LI_LI=$(echo "$CHECK"  | jq -r '.whitespace_between_li')
-WS_OL_LI=$(echo "$CHECK"  | jq -r '.whitespace_ol_to_li')
-WS_LI_OL=$(echo "$CHECK"  | jq -r '.whitespace_li_to_ol')
+SEC_IN_LI=$(echo "$CHECK" | jq -r '.section_in_li // 0')
+WS_LI_LI=$(echo "$CHECK" | jq -r '.whitespace_between_li // 0')
+WS_OL_LI=$(echo "$CHECK" | jq -r '.whitespace_ol_to_li // 0')
+WS_LI_OL=$(echo "$CHECK" | jq -r '.whitespace_li_to_ol // 0')
 if [ "$SEC_IN_LI" != "0" ]; then
     echo "⚠️  Warning: $SEC_IN_LI <li> still contain <section> wrappers — MP editor will drop the list markers and add blank rows."
     echo "   Fix: re-render with wechat-markdown-html-render (the renderer flattens these automatically)."
@@ -195,7 +140,6 @@ RESPONSE=$(curl -s -X POST "https://api.weixin.qq.com/cgi-bin/draft/add?access_t
     -H "Content-Type: application/json" \
     -d "$JSON")
 
-# 检查返回结果
 if echo "$RESPONSE" | jq -e '.media_id' > /dev/null 2>&1; then
     echo "✅ 草稿保存成功"
     echo "$RESPONSE" | jq .
