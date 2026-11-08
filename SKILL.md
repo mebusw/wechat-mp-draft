@@ -147,6 +147,21 @@ python3 scripts/remote_publish.py --dry-run ...
 | 远程连上了，但微信 API 报错（如 40164） | 不回退，直接报出真实原因（回退也解决不了白名单问题） |
 | `--mode remote` | 任何失败都不回退，直接报错 |
 
+### 本地自检工具（`scripts/wechat_html.py`）
+
+发稿命令会自动做这些检查，但**写稿阶段**也可以随时手动跑，提前发现问题：
+
+```bash
+python3 scripts/wechat_html.py check  article.html    # 字符数 / 列表 / 图片 / 外链，一览
+python3 scripts/wechat_html.py compress article.html  # 等价压缩，输出压缩后字符数
+python3 scripts/wechat_html.py sanitize article.html out.html   # 标题去重 + 列表清洗
+python3 scripts/wechat_html.py strip-h1 article.html  # 只剥离 body 开头 H1
+python3 scripts/wechat_html.py insert  article.html out.html --spec spec.json  # 插图
+```
+
+`check` 最常见的一个信号是 `whitespace_between_li > 0` —— 说明列表里有空白文本节点，
+公众号编辑器会把它们渲染成空行和错乱的编号，跑一次 `sanitize` 即可。
+
 ---
 
 ## 关键问题与解决方案
