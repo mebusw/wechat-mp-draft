@@ -172,7 +172,17 @@ python3 scripts/remote_publish.py \
 <── media_id 与回查结果 ─────────────      删除临时目录
 ```
 
-设计要点：
+### worker 是「用时才启动」，不是常驻
+
+服务器上**没有任何常驻进程** —— 没有 systemd 服务、没有 cron、没有守护进程。
+
+- 每次发稿，本机通过 `ssh` 拉起一次 `python3 remote_worker.py`，跑完（取 token → 传图 → 插图 → 存草稿 → 回查）立刻退出
+- 临时目录 `/tmp/wechat-mp-draft.XXXXXX` 用完即删（`--keep` 可保留调试）
+- 服务器磁盘上常驻的只是三个**文件**（不是进程）：`remote_worker.py`、`wechat_html.py`、`config.sh`（凭证，600 权限）
+  - 这几个文件其实是每次发稿都会重新传一遍的，磁盘上这份只是备份，方便手工排查
+- 空闲时服务器不占任何资源
+
+### 设计要点
 
 - **临时目录用完即删**（`--keep` 可保留调试）。
 - 服务器上的凭证常驻 `/root/.wechat-mp-draft/config.sh`（600 权限）；没常驻时临时送一份，

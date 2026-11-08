@@ -132,6 +132,7 @@ python3 scripts/remote_publish.py --dry-run ...
 <── 返回 media_id 与回查结果 ──────    （随后删除临时目录）
 ```
 
+- **worker 不是常驻进程**：每次发稿才通过 ssh 拉起一次，跑完立刻退出；服务器上没有 systemd 服务、没有 cron、没有守护进程，空闲时零占用。
 - 服务器上的凭证常驻在 `/root/.wechat-mp-draft/config.sh`（权限 600），由 `--setup` 安装。
   没常驻配置时，脚本会临时送一份过去，**随临时目录一起删除**。
 - 服务器只需要 `python3`（≥3.6）和 `curl`，**不需要 jq**（服务器通常没有）。
